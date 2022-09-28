@@ -2255,6 +2255,14 @@ int serial9865_find_match_or_unused(struct uart_port *port)
 	return -1;
 }
 
+// port from deprecated linux/pci-dma-compat.h
+static inline void *
+pci_alloc_consistent(struct pci_dev *hwdev, size_t size,
+					 dma_addr_t *dma_handle)
+{
+	return dma_alloc_coherent(&hwdev->dev, size, dma_handle, GFP_ATOMIC);
+}
+
 int serial9865_register_port(struct uart_port *port, struct pci_dev *dev)
 {
 	// unsigned long base, len;
@@ -2367,6 +2375,14 @@ static struct pci_device_id serial9865_pci_tbl[] = {
 		0,
 	},
 };
+
+// port from deprecated linux/pci-dma-compat.h
+static inline void
+pci_free_consistent(struct pci_dev *hwdev, size_t size,
+					void *vaddr, dma_addr_t dma_handle)
+{
+	dma_free_coherent(&hwdev->dev, size, vaddr, dma_handle);
+}
 
 // PCI driver remove function. Rlease the resources used by the port
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
@@ -2538,5 +2554,5 @@ module_init(serial9865_init);
 module_exit(serial9865_exit);
 
 MODULE_DESCRIPTION("moschip 9865 serial driver module");
-MODULE_SUPPORTED_DEVICE("moschip serial 9865");
+// MODULE_SUPPORTED_DEVICE("moschip serial 9865");
 MODULE_LICENSE("GPL");
