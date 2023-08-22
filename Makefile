@@ -7,6 +7,9 @@ MAJORVERSION=$(shell uname -r | cut -d '.' -f 1)
 MINORVERSION=$(shell uname -r | cut -d '.' -f 2)
 SUBLEVEL=$(shell uname -r | cut -d '.' -f 3)
 
+ifeq ($(MAJORVERSION),6)
+MDIR=drivers/tty/serial
+else
 ifeq ($(MAJORVERSION),5)
 MDIR=drivers/tty/serial
 else
@@ -24,6 +27,7 @@ MDIR=drivers/serial/
 endif
 else
 MDIR=drivers/serial/
+endif
 endif
 endif
 endif
