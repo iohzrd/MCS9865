@@ -13,13 +13,6 @@
 
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 15)
-#include <linux/config.h>
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 5, 0)
-#include <linux/mca.h>
-#endif
 
 #if defined(CONFIG_SERIAL_9865_CONSOLE) && defined(CONFIG_MAGIC_SYSRQ)
 #define SUPPORT_SYSRQ
@@ -37,6 +30,7 @@
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/circ_buf.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
 #include <linux/serial_reg.h>
@@ -52,10 +46,19 @@
 #include <linux/ioctl.h>
 #include "ioctl.h"
 
+ /* Kernel 6.x compatibility macros */
+#ifndef uart_circ_empty
+#define uart_circ_empty(xmit) (READ_ONCE((xmit)->tail) == READ_ONCE((xmit)->head))
+#endif
+#ifndef uart_circ_chars_pending
+#define uart_circ_chars_pending(xmit) \
+	(CIRC_CNT((xmit)->head, (xmit)->tail, UART_XMIT_SIZE))
+#endif
+
 #define UART9865_NR 16
 #define UPIO_DWAPB (6) /* DesignWare APB UART */
 
-// All transactions are with memory mapped registers
+ // All transactions are with memory mapped registers
 #define MEM_AXS 1
 
 /*
@@ -94,9 +97,9 @@ struct uart_9865_port
 	int txfifotrigger;
 	u32 dma_tx_cnt;			 // Amount of data to be DMA in TX
 	u32 dma_rx_cnt;			 // Amount of data to be DMA in RX
-	char *dma_tx_buf_v;		 // Virtual Address of DMA Buffer for TX
+	char* dma_tx_buf_v;		 // Virtual Address of DMA Buffer for TX
 	dma_addr_t dma_tx_buf_p; // Physical Address of DMA Buffer for TX
-	char *dma_rx_buf_v;		 // Virtual Address of DMA Buffer for RX
+	char* dma_rx_buf_v;		 // Virtual Address of DMA Buffer for RX
 	dma_addr_t dma_rx_buf_p; // Physical Address of DMA Buffer for TX
 	u32 part_done_recv_cnt;	 // RX DMA CIRC buffer Read index
 	int rx_dma_done_cnt;
@@ -116,7 +119,6 @@ struct uart_9865_port
 
 static struct uart_9865_port serial9865_ports[UART9865_NR];
 
-// static int test_mode=0;
 
 struct uart_9865_contxt
 {
@@ -392,8 +394,13 @@ static const struct serial9865_config uart_config[] = {
 	},
 };
 
+/* Forward declarations for functions without prototypes */
+static void setserial_ENHANC_mode(struct uart_9865_port* up);
+static int serial9865_find_match_or_unused(struct uart_port* port);
+static int serial9865_register_port(struct uart_port* port, struct pci_dev* dev);
+
 // helper function for IO type read
-static _INLINE_ u8 serial_in(struct uart_9865_port *up, int offset)
+static _INLINE_ u8 serial_in(struct uart_9865_port* up, int offset)
 {
 #if MEM_AXS
 	u8 tmp1;
@@ -405,7 +412,7 @@ static _INLINE_ u8 serial_in(struct uart_9865_port *up, int offset)
 }
 
 // helper function for IO type write
-static _INLINE_ void serial_out(struct uart_9865_port *up, int offset, int value)
+static _INLINE_ void serial_out(struct uart_9865_port* up, int offset, int value)
 {
 #if MEM_AXS
 	writel(value, up->port.membase + 0x280 + (offset * 4));
@@ -415,7 +422,7 @@ static _INLINE_ void serial_out(struct uart_9865_port *up, int offset, int value
 }
 
 // Helper function to write to index control register
-static void serial_icr_write(struct uart_9865_port *up, int offset, int value)
+static void serial_icr_write(struct uart_9865_port* up, int offset, int value)
 {
 	DEBUG("UART_LCR=0x%x\n", serial_in(up, UART_LCR));
 	serial_out(up, UART_SCR, offset);
@@ -423,7 +430,7 @@ static void serial_icr_write(struct uart_9865_port *up, int offset, int value)
 }
 
 // Helper function to read from index control register
-static unsigned int serial_icr_read(struct uart_9865_port *up, int offset)
+static unsigned int serial_icr_read(struct uart_9865_port* up, int offset)
 {
 	unsigned int value;
 	serial_icr_write(up, UART_ACR, up->acr | UART_ACR_ICRRD);
@@ -434,7 +441,7 @@ static unsigned int serial_icr_read(struct uart_9865_port *up, int offset)
 }
 
 // Helper function to set the 950 mode
-void setserial_ENHANC_mode(struct uart_9865_port *up)
+static void setserial_ENHANC_mode(struct uart_9865_port* up)
 {
 	u8 lcr, efr;
 	DEBUG("In %s---------------------------------------START\n", __FUNCTION__);
@@ -452,7 +459,7 @@ void setserial_ENHANC_mode(struct uart_9865_port *up)
 }
 
 // Helper function to clear the FIFO
-static inline void serial9865_clear_fifos(struct uart_9865_port *p)
+static inline void serial9865_clear_fifos(struct uart_9865_port* p)
 {
 	if (p->capabilities & UART_CAP_FIFO)
 	{
@@ -463,7 +470,7 @@ static inline void serial9865_clear_fifos(struct uart_9865_port *p)
 }
 
 // Helper function to set the the UART to sleep mode
-static inline void serial9865_set_sleep(struct uart_9865_port *p, int sleep)
+static inline void serial9865_set_sleep(struct uart_9865_port* p, int sleep)
 {
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
 	if (p->capabilities & UART_CAP_SLEEP)
@@ -486,13 +493,9 @@ static inline void serial9865_set_sleep(struct uart_9865_port *p, int sleep)
 }
 
 // Member function of the port operations to stop the data transfer
-#if LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 11)
-static void serial9865_stop_tx(struct uart_port *port, unsigned int tty_stop)
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 14)
-static void serial9865_stop_tx(struct uart_port *port)
-#endif
+static void serial9865_stop_tx(struct uart_port* port)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
 	if (up->dma_tx)
 	{
@@ -511,20 +514,11 @@ static void serial9865_stop_tx(struct uart_port *port)
 }
 
 // Member function of the port operations to start the data transfer
-#if LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 11)
-static void serial9865_start_tx(struct uart_port *port, unsigned int tty_start)
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 14)
-static void serial9865_start_tx(struct uart_port *port)
-#endif
+static void serial9865_start_tx(struct uart_port* port)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 31)
-	struct circ_buf *xmit = &up->port.info->xmit;
-#else
-	struct circ_buf *xmit = &up->port.state->xmit;
-#endif
-	u32 length = 0, len2end;
-	int tail, head;
+	struct uart_9865_port* up = &serial9865_ports[port->line];
+	struct tty_port* tport = &up->port.state->port;
+	u32 length = 0;
 
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
 
@@ -533,8 +527,8 @@ static void serial9865_start_tx(struct uart_port *port)
 		DEBUG(" I WAS IN DMA OF START_TX\n");
 
 		// CALCULATING THE AMOUNT OF DATA AVAILABLE FOR THE NEXT TRANSFER
-		// AND COPYING THE DATA TO THE DMA BUFFER
-		length = uart_circ_chars_pending(xmit);
+		// AND COPYING THE DATA TO THE DMA BUFFER using kfifo
+		length = kfifo_len(&tport->xmit_fifo);
 
 		if (length == 0)
 		{
@@ -542,53 +536,22 @@ static void serial9865_start_tx(struct uart_port *port)
 			return;
 		}
 
-		head = xmit->head;
-		tail = xmit->tail;
-		len2end = CIRC_CNT_TO_END(head, tail, UART_XMIT_SIZE);
-		DEBUG("In %s -------------------xmit->tail=%d, xmit->head=%d,length=%d,length2end=%d\n", __FUNCTION__, tail, head, length, len2end);
+		// For kernel 6.10+, use kfifo_out_peek to copy data to DMA buffer
+		// without removing it from the fifo (it will be removed in transmit_chars_dma_done)
+		if (length > DMA_TX_BUFFER_SZ)
+			length = DMA_TX_BUFFER_SZ;
 
-		if (tail < head)
+		up->dma_tx_cnt = kfifo_out_peek(&tport->xmit_fifo, up->dma_tx_buf_v, length);
+
+		if (up->dma_tx_cnt == 0)
 		{
-			if (length <= DMA_TX_BUFFER_SZ)
-			{
-				DEBUG("In %s normal circ buffer\n", __FUNCTION__);
-				memcpy(up->dma_tx_buf_v, &xmit->buf[tail], length); // xmit->buf + xmit->tail
-				up->dma_tx_cnt = length;
-			}
-			else
-			{
-				memcpy(up->dma_tx_buf_v, &xmit->buf[tail], DMA_TX_BUFFER_SZ);
-				up->dma_tx_cnt = DMA_TX_BUFFER_SZ;
-			}
-		}
-		else
-		{
-			if (length <= DMA_TX_BUFFER_SZ)
-			{
-				DEBUG("In %s 2 mode circ buffer\n", __FUNCTION__);
-				memcpy(up->dma_tx_buf_v, &xmit->buf[tail], len2end);
-				memcpy(up->dma_tx_buf_v + len2end, xmit->buf, head);
-				up->dma_tx_cnt = length;
-			}
-			else
-			{
-				if (len2end <= DMA_TX_BUFFER_SZ)
-				{
-					memcpy(up->dma_tx_buf_v, &xmit->buf[tail], len2end);
-					memcpy(up->dma_tx_buf_v + len2end, xmit->buf, DMA_TX_BUFFER_SZ - len2end);
-					up->dma_tx_cnt = len2end;
-				}
-				else
-				{
-					memcpy(up->dma_tx_buf_v, &xmit->buf[tail], DMA_TX_BUFFER_SZ);
-					up->dma_tx_cnt = DMA_TX_BUFFER_SZ;
-				}
-			}
+			DEBUG("In %s TX kfifo_out_peek returned 0\n", __FUNCTION__);
+			return;
 		}
 
 		up->serialise_txdma++; // variable to serialise the DMA tx calls
 		DEBUG("In %s up->dma_tx_cnt=%d\n", __FUNCTION__, up->dma_tx_cnt);
-		DEBUG("IN %s length=%d and data in dma->buf is: %s\n", __FUNCTION__, length, up->dma_tx_buf_v);
+		DEBUG("IN %s length=%d and data in dma->buf is: %.*s\n", __FUNCTION__, length, up->dma_tx_cnt, up->dma_tx_buf_v);
 
 		spin_lock(&up->lock_9865);
 		writel(up->dma_tx_buf_p, up->port.membase + REG_TX_DMA_START_ADDRESS_LOW);
@@ -612,9 +575,9 @@ static void serial9865_start_tx(struct uart_port *port)
 }
 
 // Member function of the port operations to stop receiving the data
-static void serial9865_stop_rx(struct uart_port *port)
+static void serial9865_stop_rx(struct uart_port* port)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	u32 value = 0;
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
 	if (up->dma_rx)
@@ -632,9 +595,9 @@ static void serial9865_stop_rx(struct uart_port *port)
 }
 
 // Member function of the port operations to enable modem status change interrupt
-static void serial9865_enable_ms(struct uart_port *port)
+static void serial9865_enable_ms(struct uart_port* port)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 
 	DEBUG("In %s --------------------------------------- START\n", __FUNCTION__);
 	up->ier |= UART_IER_MSI;
@@ -642,7 +605,7 @@ static void serial9865_enable_ms(struct uart_port *port)
 }
 
 // Function to check modem statuss
-static _INLINE_ void check_modem_status(struct uart_9865_port *up)
+static _INLINE_ void check_modem_status(struct uart_9865_port* up)
 {
 	u8 status;
 
@@ -661,28 +624,14 @@ static _INLINE_ void check_modem_status(struct uart_9865_port *up)
 	if (status & UART_MSR_DCTS)
 		uart_handle_cts_change(&up->port, status & UART_MSR_CTS);
 
-#if (LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 31))
-	wake_up_interruptible(&up->port.info->delta_msr_wait);
-#else
 	wake_up_interruptible(&up->port.state->port.delta_msr_wait);
-#endif
 	DEBUG("In %s -------------------- END\n", __FUNCTION__);
 }
 
 // Helper function used in ISR to receive the the charecters from the UART
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 20))
-static _INLINE_ void receive_chars(struct uart_9865_port *up, u8 *status)
-#else
-static _INLINE_ void receive_chars(struct uart_9865_port *up, u8 *status, struct pt_regs *regs)
-#endif
+static _INLINE_ void receive_chars(struct uart_9865_port* up, u8* status)
 {
-#if (LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 26))
-	struct tty_struct *tty = up->port.info->tty;
-#elif (LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 26) && (LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 31)))
-	struct tty_struct *tty = up->port.info->port.tty;
-#else
-	struct tty_struct *tty = up->port.state->port.tty;
-#endif
+	struct tty_struct* tty = up->port.state->port.tty;
 	u8 ch, lsr = *status;
 	int max_count = 256;
 	unsigned int flag;
@@ -692,23 +641,8 @@ static _INLINE_ void receive_chars(struct uart_9865_port *up, u8 *status, struct
 	spin_lock_irqsave(&up->port.lock, flags);
 	do
 	{
-/* The following is not allowed by the tty layer and
-   unsafe. It should be fixed ASAP */
-#if LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 11)
-		if (unlikely(tty->flip.count >= TTY_FLIPBUF_SIZE))
-		{
-			if (tty->low_latency)
-			{
-				spin_unlock(&up->port.lock);
-				tty_flip_buffer_push(tty);
-				spin_lock(&up->port.lock);
-			}
-			/*
-			 * If this failed then we will throw away the
-			 * bytes but must do so to clear interrupts
-			 */
-		}
-#endif
+		/* The following is not allowed by the tty layer and
+		   unsafe. It should be fixed ASAP */
 		ch = serial_in(up, UART_RX);
 		flag = TTY_NORMAL;
 		up->port.icount.rx++;
@@ -753,13 +687,8 @@ static _INLINE_ void receive_chars(struct uart_9865_port *up, u8 *status, struct
 			else if (lsr & UART_LSR_FE)
 				flag = TTY_FRAME;
 		}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 20)
-		if (uart_handle_sysrq_char(&up->port, ch, regs))
-			goto ignore_char;
-#else
 		if (uart_handle_sysrq_char(&up->port, ch))
 			goto ignore_char;
-#endif
 
 		uart_insert_char(&up->port, lsr, UART_LSR_OE, ch, flag);
 
@@ -768,11 +697,7 @@ static _INLINE_ void receive_chars(struct uart_9865_port *up, u8 *status, struct
 		lsr = serial_in(up, UART_LSR);
 	} while ((lsr & UART_LSR_DR) && (max_count-- > 0));
 	// spin_unlock(&up->port.lock);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0)
 	tty_flip_buffer_push(tty->port);
-#else
-	tty_flip_buffer_push(tty);
-#endif
 	// spin_lock(&up->port.lock);
 	*status = lsr;
 	spin_unlock_irqrestore(&up->port.lock, flags);
@@ -780,13 +705,10 @@ static _INLINE_ void receive_chars(struct uart_9865_port *up, u8 *status, struct
 }
 
 // Helper function used in ISR to send the data to the UART
-static _INLINE_ void transmit_chars(struct uart_9865_port *up)
+static _INLINE_ void transmit_chars(struct uart_9865_port* up)
 {
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 31)
-	struct circ_buf *xmit = &up->port.info->xmit;
-#else
-	struct circ_buf *xmit = &up->port.state->xmit;
-#endif
+	struct tty_port* tport = &up->port.state->port;
+	u8 ch;
 	int count;
 
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
@@ -797,13 +719,9 @@ static _INLINE_ void transmit_chars(struct uart_9865_port *up)
 		up->port.x_char = 0;
 		return;
 	}
-	if (uart_circ_empty(xmit) || uart_tx_stopped(&up->port))
+	if (kfifo_is_empty(&tport->xmit_fifo) || uart_tx_stopped(&up->port))
 	{
-#if LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 11)
-		serial9865_stop_tx(&up->port, 0);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 14)
 		serial9865_stop_tx(&up->port);
-#endif
 		return;
 	}
 
@@ -811,23 +729,20 @@ static _INLINE_ void transmit_chars(struct uart_9865_port *up)
 	DEBUG("In %s-----------up->port.type=%d,tx_loadsz=%d\n", __FUNCTION__, up->port.type, count);
 	do
 	{
-		serial_out(up, UART_TX, xmit->buf[xmit->tail]);
-		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+		if (!kfifo_get(&tport->xmit_fifo, &ch))
+			break;
+		serial_out(up, UART_TX, ch);
 		up->port.icount.tx++;
-		if (uart_circ_empty(xmit))
+		if (kfifo_is_empty(&tport->xmit_fifo))
 			break;
 	} while (--count > 0);
 
-	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+	if (kfifo_len(&tport->xmit_fifo) < WAKEUP_CHARS)
 		uart_write_wakeup(&up->port);
 
-	if (uart_circ_empty(xmit))
+	if (kfifo_is_empty(&tport->xmit_fifo))
 	{
-#if LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 11)
-		serial9865_stop_tx(&up->port, 0);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 14)
 		serial9865_stop_tx(&up->port);
-#endif
 	}
 	DEBUG("In %s --------------------------------------2END\n", __FUNCTION__);
 }
@@ -839,127 +754,76 @@ static void transmit_chars_dma_stop_done(struct uart_9865_port * up)
 		long int transferred;
 		DEBUG("In %s ---------------------------------------START\n",__FUNCTION__);
 		//UPDATING THE TRANSMIT FIFO WITH THE AMOUNT OF DATA TRANSFERRED
-		transferred=readl(up->port.membase+REG_TX_BYTES_TRANSFERRED);
+		transferred = readl(up->port.membase + REG_TX_BYTES_TRANSFERRED);
 		xmit->tail=((xmit->tail)+transferred) & (UART_XMIT_SIZE-1);
 		up->port.icount.tx += transferred;
-		up->serialise_txdma=0;
+		up->serialise_txdma = 0;
 
 		memset(up->dma_tx_buf_v,0,DMA_TX_BUFFER_SZ);
 		DEBUG("In %s ---------------------------------------END\n",__FUNCTION__);
 }
 */
 // Helper function to do the necessary action upon the successful completion of data transfer in DMA mode
-static int transmit_chars_dma_done(struct uart_9865_port *up)
+static int transmit_chars_dma_done(struct uart_9865_port* up)
 {
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 31)
-	struct circ_buf *xmit = &(up->port.info->xmit);
-#else
-	struct circ_buf *xmit = &(up->port.state->xmit);
-#endif
-	int length, tobe_transferred, transferred, len2end;
+	struct tty_port* tport = &up->port.state->port;
+	int length, tobe_transferred, transferred;
 
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
 
-	// UPDATING THE xmit FIFO WITH THE AMOUNT OF DATA TRANSFERRED
-	tobe_transferred = readl(up->port.membase + REG_TX_BYTES_TRANSFERRED);
-	transferred = (up->dma_tx_cnt - tobe_transferred);
-	DEBUG("In %s -------------transferred=%d--------------------------START\n", __FUNCTION__, transferred);
-	xmit->tail = ((xmit->tail) + transferred) & (UART_XMIT_SIZE - 1);
+	transferred = up->dma_tx_cnt;
+	DEBUG("In %s transferred=%d\n", __FUNCTION__, transferred);
 
+	// Remove the transmitted data from the kfifo
+	kfifo_skip_count(&tport->xmit_fifo, transferred);
+
+	// Update transmit statistics
 	up->port.icount.tx += transferred;
-	length = uart_circ_chars_pending(xmit);
-	DEBUG("In %s circ_buf lenght=%d after\n", __FUNCTION__, length);
-	memset(up->dma_tx_buf_v, 0, DMA_TX_BUFFER_SZ);
 
-	DEBUG("In %s up->dma_tx_buf_v=0x%x ---------------------------------------START\n", __FUNCTION__, (unsigned int)up->dma_tx_buf_v);
+	// Check if there's more data to transmit
+	length = kfifo_len(&tport->xmit_fifo);
+	DEBUG("In %s remaining length=%d\n", __FUNCTION__, length);
 
-	if (uart_circ_empty(xmit) || uart_tx_stopped(&up->port))
-	{
-		up->serialise_txdma = 0;
-		if (length < WAKEUP_CHARS)
-			uart_write_wakeup(&up->port);
-		return 0;
-	}
-
-	// CALCULATING THE AMOUNT OF DATA AVAILABLE FOR THE NEXT TRANSFER
-	// AND COPYING THE DATA TO THE DMA BUFFER
-
-	length = uart_circ_chars_pending(xmit);
-	len2end = CIRC_CNT_TO_END(xmit->head, xmit->tail, UART_XMIT_SIZE);
-	DEBUG("In %s -------------------xmit->tail=%d, xmit->head=%d,length=%d,length2end=%d\n", __FUNCTION__, xmit->tail, xmit->head, length, len2end);
-
-	if (xmit->tail < xmit->head)
-	{
-		if (length <= DMA_TX_BUFFER_SZ)
-		{
-			memcpy(up->dma_tx_buf_v, &xmit->buf[xmit->tail], length); // xmit->buf + xmit->tail
-			up->dma_tx_cnt = length;
-			DEBUG("In %s Normal mode\n", __FUNCTION__);
-		}
-		else
-		{
-			memcpy(up->dma_tx_buf_v, &xmit->buf[xmit->tail], DMA_TX_BUFFER_SZ);
-			up->dma_tx_cnt = DMA_TX_BUFFER_SZ;
-		}
-	}
-	else
-	{
-		if (length <= DMA_TX_BUFFER_SZ)
-		{
-			DEBUG("In %s 2nd mode\n", __FUNCTION__);
-			memcpy(up->dma_tx_buf_v, &xmit->buf[xmit->tail], len2end);
-			memcpy(up->dma_tx_buf_v + len2end, xmit->buf, xmit->head);
-			up->dma_tx_cnt = length;
-		}
-		else
-		{
-			if (len2end <= DMA_TX_BUFFER_SZ)
-			{
-				memcpy(up->dma_tx_buf_v, &xmit->buf[xmit->tail], len2end);
-				memcpy(up->dma_tx_buf_v + len2end, xmit->buf, DMA_TX_BUFFER_SZ - len2end);
-				up->dma_tx_cnt = len2end;
-			}
-			else
-			{
-				memcpy(up->dma_tx_buf_v, &xmit->buf[xmit->tail], DMA_TX_BUFFER_SZ);
-				up->dma_tx_cnt = DMA_TX_BUFFER_SZ;
-			}
-		}
-	}
-
-	DEBUG("In %s length=%d\n", __FUNCTION__, length);
-
-	// INITIATING THE NEXT TRANSFER
-
-	// Writing the source address to the TX DMA
-	writel(up->dma_tx_buf_p, up->port.membase + REG_TX_DMA_START_ADDRESS_LOW);
-	// Writing the source address to the TX DMA
-	writel(0, up->port.membase + REG_TX_DMA_START_ADDRESS_HIGH);
-
-	// Writing the length of data to the TX DMA Length register
-	// writel(length,up->port.membase+REG_TX_DMA_LENGTH);
-	writel(up->dma_tx_cnt, up->port.membase + REG_TX_DMA_LENGTH);
-
-	// Start the DMA data transfer
-	writel(TX_DMA_START_BIT, up->port.membase + REG_TX_DMA_START);
-
-	// Requesting more data to send out from the TTY layer to the driver
+	// Wake up TTY layer if buffer is getting low
 	if (length < WAKEUP_CHARS)
 		uart_write_wakeup(&up->port);
+
+	// Reset DMA serialization flag to allow new transfers
+	up->serialise_txdma = 0;
+
+	// If there's more data, start another DMA transfer
+	if (length > 0)
+	{
+		// Calculate how much to transfer next
+		tobe_transferred = (length > DMA_TX_BUFFER_SZ) ? DMA_TX_BUFFER_SZ : length;
+
+		// Copy data to DMA buffer
+		up->dma_tx_cnt = kfifo_out_peek(&tport->xmit_fifo, up->dma_tx_buf_v, tobe_transferred);
+
+		if (up->dma_tx_cnt > 0)
+		{
+			up->serialise_txdma++; // Set serialization flag
+
+			DEBUG("In %s starting next DMA transfer, cnt=%d\n", __FUNCTION__, up->dma_tx_cnt);
+
+			// Start the next DMA transfer
+			spin_lock(&up->lock_9865);
+			writel(up->dma_tx_buf_p, up->port.membase + REG_TX_DMA_START_ADDRESS_LOW);
+			writel(0, up->port.membase + REG_TX_DMA_START_ADDRESS_HIGH);
+			writel(up->dma_tx_cnt, up->port.membase + REG_TX_DMA_LENGTH);
+			writel(TX_DMA_START_BIT, up->port.membase + REG_TX_DMA_START);
+			spin_unlock(&up->lock_9865);
+		}
+	}
+
 	DEBUG("In %s ---------------------------------------END\n", __FUNCTION__);
 	return 0;
 }
 
 // Helper function to do the necessary action upon the successful completion of data receive in DMA mode
-static void receive_chars_dma_done(struct uart_9865_port *up, int iirg)
+static void receive_chars_dma_done(struct uart_9865_port* up, int iirg)
 {
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 26)
-	struct tty_struct *tty = up->port.info->tty;
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 32)
-	struct tty_struct *tty = up->port.info->port.tty;
-#else
-	struct tty_struct *tty = up->port.state->port.tty;
-#endif
+	struct tty_struct* tty = up->port.state->port.tty;
 
 	int i;
 	int rxdma_done = 0;
@@ -969,17 +833,6 @@ static void receive_chars_dma_done(struct uart_9865_port *up, int iirg)
 
 	DEBUG("In %s ---------iirg=0x%x------------------------------START\n", __FUNCTION__, iirg);
 	// checking for the flip buffer size and asking to clear it upon some threshold
-#if LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 11)
-	if (unlikely(tty->flip.count >= TTY_FLIPBUF_SIZE))
-	{
-		if (tty->low_latency)
-		{
-			spin_unlock(&up->port.lock);
-			tty_flip_buffer_push(tty);
-			spin_lock(&up->port.lock);
-		}
-	}
-#endif
 	if ((iirg & SPINTR_RXDMA_PARTDONE) || (iirg & SPINTR_RXDMA_DONE) /* || (iirg & SPINTR_RXDMA_ABORT_DONE)*/)
 	{
 		// checking for the number of bytes received
@@ -1042,12 +895,6 @@ static void receive_chars_dma_done(struct uart_9865_port *up, int iirg)
 			for (i = 1; i <= received_bytes; i++)
 			{
 				/* if we insert more than TTY_FLIPBUF_SIZE characters, tty layer will drop them. */
-#if LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 11)
-				if (tty->flip.count >= TTY_FLIPBUF_SIZE)
-				{
-					tty_flip_buffer_push(tty);
-				}
-#endif
 				/* this doesn't actually push the data through unless tty->low_latency is set */
 				uart_insert_char(&up->port, status, UART_LSR_OE, up->dma_rx_buf_v[up->part_done_recv_cnt], TTY_NORMAL);
 				up->part_done_recv_cnt++;
@@ -1055,45 +902,20 @@ static void receive_chars_dma_done(struct uart_9865_port *up, int iirg)
 				if (up->part_done_recv_cnt == DMA_RX_BUFFER_SZ)
 					up->part_done_recv_cnt = 0;
 			}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0)
 			tty_flip_buffer_push(tty->port);
-#else
-			tty_flip_buffer_push(tty);
-#endif
 		}
 
 		up->port.icount.rx += received_bytes;
 
-#if LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 11)
-		if (unlikely(tty->flip.count >= TTY_FLIPBUF_SIZE))
-		{
-			if (tty->low_latency)
-			{
-				spin_unlock(&up->port.lock);
-				tty_flip_buffer_push(tty);
-				spin_lock(&up->port.lock);
-			}
-		}
-#endif
 	}
 }
 
 // This handles the interrupt from a port in IO mode.
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 20))
-static inline void serial9865_handle_port(struct uart_9865_port *up)
-#else
-static inline void serial9865_handle_port(struct uart_9865_port *up, struct pt_regs *regs)
-#endif
+static inline void serial9865_handle_port(struct uart_9865_port* up)
 {
 	u8 status = serial_in(up, UART_LSR);
 
-#if (LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 26))
-	struct tty_struct *tty = up->port.info->tty;
-#elif (LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 26) && (LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 31)))
-	struct tty_struct *tty = up->port.info->port.tty;
-#else
-	struct tty_struct *tty = up->port.state->port.tty;
-#endif
+	struct tty_struct* tty = up->port.state->port.tty;
 
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
 	DEBUG("UART_LSR = %x...", status);
@@ -1101,11 +923,7 @@ static inline void serial9865_handle_port(struct uart_9865_port *up, struct pt_r
 	if ((status & UART_LSR_DR) && !up->dma_rx)
 	{
 		DEBUG("RECEIVE_CHARS\n");
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 20))
 		receive_chars(up, &status);
-#else
-		receive_chars(up, &status, regs);
-#endif
 	}
 
 	check_modem_status(up);
@@ -1152,24 +970,16 @@ static inline void serial9865_handle_port(struct uart_9865_port *up, struct pt_r
 		}
 		if (status & ~up->port.ignore_status_mask & UART_LSR_OE)
 		{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0)
 			tty_insert_flip_char(tty->port, 0, TTY_OVERRUN);
-#else
-			tty_insert_flip_char(tty, 0, TTY_OVERRUN);
-#endif
 		}
 	}
 	DEBUG("In %s ---------------------------------------END\n", __FUNCTION__);
 }
 
 // This is the 9865 type serial driver's interrupt routine.
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 20)
-static irqreturn_t serial9865_interrupt(int irq, void *dev_id)
-#else
-static irqreturn_t serial9865_interrupt(int irq, void *dev_id, struct pt_regs *regs)
-#endif
+static irqreturn_t serial9865_interrupt(int irq, void* dev_id)
 {
-	struct uart_9865_port *up = dev_id;
+	struct uart_9865_port* up = dev_id;
 	u32 iirg = 0;
 	u8 iir;
 	int handled = 0;
@@ -1188,9 +998,6 @@ static irqreturn_t serial9865_interrupt(int irq, void *dev_id, struct pt_regs *r
 			transmit_chars_dma_done(up);
 			handled = 1;
 		}
-		//		if((iirg & SPINTR_TXDMA_STOP_DONE) ||(iirg & SPINTR_TXDMA_ABORT_DONE)){
-		//			handled=1;
-		//			transmit_chars_dma_stop_done(up);
 		if (iirg & (SPINTR_RXDMA_DONE | SPINTR_RXDMA_PARTDONE))
 		{
 			receive_chars_dma_done(up, iirg);
@@ -1220,12 +1027,8 @@ static irqreturn_t serial9865_interrupt(int irq, void *dev_id, struct pt_regs *r
 	{
 
 		DEBUG("In %s IIR=0x%x UART_SCR=0x%x\n", __FUNCTION__, iir, serial_in(up, UART_SCR));
-//	spin_lock(&up->port.lock);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 20)
+		//	spin_lock(&up->port.lock);
 		serial9865_handle_port(up);
-#else
-		serial9865_handle_port(up, regs);
-#endif
 		//	spin_unlock(&up->port.lock);
 		handled = 1;
 	}
@@ -1233,9 +1036,9 @@ static irqreturn_t serial9865_interrupt(int irq, void *dev_id, struct pt_regs *r
 }
 
 // This is a port ops helper function to verify wether the transmitter is empty of not
-static unsigned int serial9865_tx_empty(struct uart_port *port)
+static unsigned int serial9865_tx_empty(struct uart_port* port)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	unsigned long flags;
 	unsigned int ret;
 
@@ -1249,9 +1052,9 @@ static unsigned int serial9865_tx_empty(struct uart_port *port)
 }
 
 // This is a port ops helper function to find the current state of the modem control
-static unsigned int serial9865_get_mctrl(struct uart_port *port)
+static unsigned int serial9865_get_mctrl(struct uart_port* port)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	unsigned long flags;
 	u8 status;
 	unsigned int ret;
@@ -1276,9 +1079,9 @@ static unsigned int serial9865_get_mctrl(struct uart_port *port)
 }
 
 // This is a port ops helper function to set the modem control lines
-static void serial9865_set_mctrl(struct uart_port *port, unsigned int mctrl)
+static void serial9865_set_mctrl(struct uart_port* port, unsigned int mctrl)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	u8 mcr = 0;
 
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
@@ -1300,9 +1103,9 @@ static void serial9865_set_mctrl(struct uart_port *port, unsigned int mctrl)
 }
 
 // This is a port ops helper function to control the transmission of a break signal
-static void serial9865_break_ctl(struct uart_port *port, int break_state)
+static void serial9865_break_ctl(struct uart_port* port, int break_state)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	unsigned long flags;
 
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
@@ -1317,16 +1120,15 @@ static void serial9865_break_ctl(struct uart_port *port, int break_state)
 }
 
 // This is a port ops helper function to enable the port for reception
-static int serial9865_startup(struct uart_port *port)
+static int serial9865_startup(struct uart_port* port)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	unsigned long flags;
 	u8 fcr = 0, efr = 0, lcr = 0, cks = 0, acr = 0, mcr = 0;
 	u32 tmp, ser_dcr_din_val = 0, ser_ven_val = 0;
 	int uart_mode = 0;
 
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
-	// printk("%s: port.type:%x\n",__FUNCTION__,up->port.type);
 
 	up->capabilities = uart_config[up->port.type].flags;
 	up->mcr = 0;
@@ -1638,16 +1440,16 @@ static int serial9865_startup(struct uart_port *port)
 
 // This is a port ops helper function to disable the port, disable any break condition that may be in
 // effect, and free any interrupt resources.
-static void serial9865_shutdown(struct uart_port *port)
+static void serial9865_shutdown(struct uart_port* port)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	unsigned long flags;
 
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
 
 	printk("No of Errors In ttyD%d brake=%d frame=%d parity=%d overrun=%d\n",
-		   port->line, port->icount.brk, port->icount.frame, port->icount.parity,
-		   port->icount.overrun);
+		port->line, port->icount.brk, port->icount.frame, port->icount.parity,
+		port->icount.overrun);
 	/*
 	 * Disable interrupts from this port
 	 */
@@ -1699,7 +1501,7 @@ static void serial9865_shutdown(struct uart_port *port)
 
 // This is a port ops helper function to return the divsor (baud_base / baud) for the selected baud rate
 //	specified by termios.
-static unsigned int serial9865_get_divisor(struct uart_port *port, unsigned int baud)
+static unsigned int serial9865_get_divisor(struct uart_port* port, unsigned int baud)
 {
 	unsigned int quot;
 
@@ -1712,14 +1514,10 @@ static unsigned int serial9865_get_divisor(struct uart_port *port, unsigned int 
 }
 
 // This is a port ops function to set the terminal settings.
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 20)
-static void serial9865_set_termios(struct uart_port *port, struct ktermios *termios, struct ktermios *old)
-#else
-static void serial9865_set_termios(struct uart_port *port, struct termios *termios, struct termios *old)
-#endif
+static void serial9865_set_termios(struct uart_port* port, struct ktermios* termios, const struct ktermios* old)
 
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	u8 cval, fcr = 0;
 	unsigned long flags;
 	unsigned int baud, quot;
@@ -1965,22 +1763,22 @@ static void serial9865_set_termios(struct uart_port *port, struct termios *termi
 	DEBUG("In %s ------------------------------END\n", __FUNCTION__);
 }
 
-static void serial9865_pm(struct uart_port *port, unsigned int state, unsigned int oldstate)
+static void serial9865_pm(struct uart_port* port, unsigned int state, unsigned int oldstate)
 {
-	struct uart_9865_port *p = &serial9865_ports[port->line];
+	struct uart_9865_port* p = &serial9865_ports[port->line];
 	serial9865_set_sleep(p, state != 0);
 }
 
 // Helper function to relase the kernel resources used by the port
-static void serial9865_release_port(struct uart_port *port)
+static void serial9865_release_port(struct uart_port* port)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	int size = 8, mem_size = 4096;
 	switch (up->port.iotype)
 	{
 	case UPIO_AU:
 		size = 0x100000;
-		/* fall thru */
+		/* fall through */
 	case UPIO_TSI:
 	case UPIO_MEM32:
 	case UPIO_MEM:
@@ -1999,25 +1797,23 @@ static void serial9865_release_port(struct uart_port *port)
 
 	case UPIO_HUB6:
 	case UPIO_PORT:
-		//		printk("%s  port.iobase:%x\n",__FUNCTION__,up->port.iobase);
-		//		if(up->port.iobase)
-		//              release_region(up->port.iobase, size);
+		break;
+	case UPIO_UNKNOWN:
+	case UPIO_MEM16:
 		break;
 	}
 }
 
-static void serial9865_config_port(struct uart_port *port, int flags)
+static void serial9865_config_port(struct uart_port* port, int flags)
 {
 
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	int ret = 0, size = 8, mem_size = 4096;
-	// printk("%s  flags:%d\n",__FUNCTION__,flags);
-	// printk("up->port.flags:%x  up->port.type:%d\n",up->port.flags,up->port.type);
 	switch (up->port.iotype)
 	{
 	case UPIO_AU:
 		size = 0x100000;
-		/* fall thru */
+		/* fall through */
 	case UPIO_TSI:
 	case UPIO_MEM32:
 	case UPIO_MEM:
@@ -2045,6 +1841,9 @@ static void serial9865_config_port(struct uart_port *port, int flags)
 	case UPIO_PORT:
 		if (!request_region(up->port.iobase, size, "mcs9865-serial"))
 			ret = -EBUSY;
+		break;
+	case UPIO_UNKNOWN:
+	case UPIO_MEM16:
 		break;
 	}
 	if (flags & UART_CONFIG_TYPE)
@@ -2058,7 +1857,7 @@ static void serial9865_config_port(struct uart_port *port, int flags)
 }
 
 static int
-serial9865_verify_port(struct uart_port *port, struct serial_struct *ser)
+serial9865_verify_port(struct uart_port* port, struct serial_struct* ser)
 {
 	if (ser->irq >= NR_IRQS || ser->irq < 0 ||
 		ser->baud_base < 9600 || ser->type < PORT_UNKNOWN ||
@@ -2069,16 +1868,16 @@ serial9865_verify_port(struct uart_port *port, struct serial_struct *ser)
 }
 
 // Helper function to get the necessary kernel resources for the port
-static int serial9865_request_port(struct uart_port *port)
+static int serial9865_request_port(struct uart_port* port)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 	int ret = 0, size = 8, mem_size = 4096;
 
 	switch (up->port.iotype)
 	{
 	case UPIO_AU:
 		size = 0x100000;
-		/* fall thru */
+		/* fall through */
 	case UPIO_TSI:
 	case UPIO_MEM32:
 	case UPIO_MEM:
@@ -2107,23 +1906,26 @@ static int serial9865_request_port(struct uart_port *port)
 		if (!request_region(up->port.iobase, size, "mcs9865-serial"))
 			ret = -EBUSY;
 		break;
+	case UPIO_UNKNOWN:
+	case UPIO_MEM16:
+		break;
 	}
 	return ret;
 }
 
-static const char *serial9865_type(struct uart_port *port)
+static const char* serial9865_type(struct uart_port* port)
 {
 	return "mcs9865-serial";
 }
 
-static int serial9865_ioctl(struct uart_port *port, unsigned int cmd, unsigned long arg)
+static int serial9865_ioctl(struct uart_port* port, unsigned int cmd, unsigned long arg)
 {
-	struct uart_9865_port *up = &serial9865_ports[port->line];
+	struct uart_9865_port* up = &serial9865_ports[port->line];
 
 	switch (cmd)
 	{
 	case IOCTL_GET_CUSTOM:
-		__put_user(up->custom_baud, (int __user *)arg);
+		__put_user(up->custom_baud, (int __user*)arg);
 		break;
 	case IOCTL_SET_CUSTOM:
 		if (arg == 0)
@@ -2167,7 +1969,7 @@ static struct uart_ops serial9865_pops = {
 };
 
 // Initialising the global per port context array to the default values
-static void serial9865_init_port(struct uart_9865_port *up)
+static void serial9865_init_port(struct uart_9865_port* up)
 {
 	spin_lock_init(&up->port.lock);
 	spin_lock_init(&up->lock_9865);
@@ -2192,27 +1994,8 @@ static void __init serial9865_init_ports(void)
 	DEBUG("In %s---------------------------------------END\n", __FUNCTION__);
 }
 
-/*
- *	Are the two ports equivalent?
- */
-int serial9865_match_port(struct uart_port *port1, struct uart_port *port2)
-{
-	if (port1->iotype != port2->iotype)
-		return 0;
 
-	if ((port1->iobase == port2->iobase) && (port1->membase == port2->membase))
-	{
-		return 1;
-	}
-	else
-		return 0;
-}
-
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 36)
-static DECLARE_MUTEX(serial9865_sem);
-#else
-static DEFINE_SEMAPHORE(serial9865_sem);
-#endif
+static DEFINE_SEMAPHORE(serial9865_sem, 1);
 
 static struct uart_driver mcs9865_serial_driver = {
 	.owner = THIS_MODULE,
@@ -2224,7 +2007,7 @@ static struct uart_driver mcs9865_serial_driver = {
 	.cons = NULL,
 };
 
-int serial9865_find_match_or_unused(struct uart_port *port)
+int serial9865_find_match_or_unused(struct uart_port* port)
 {
 	int i;
 
@@ -2256,14 +2039,14 @@ int serial9865_find_match_or_unused(struct uart_port *port)
 }
 
 // port from deprecated linux/pci-dma-compat.h
-static inline void *
-pci_alloc_consistent(struct pci_dev *hwdev, size_t size,
-					 dma_addr_t *dma_handle)
+static inline void*
+pci_alloc_consistent(struct pci_dev* hwdev, size_t size,
+	dma_addr_t* dma_handle)
 {
 	return dma_alloc_coherent(&hwdev->dev, size, dma_handle, GFP_ATOMIC);
 }
 
-int serial9865_register_port(struct uart_port *port, struct pci_dev *dev)
+int serial9865_register_port(struct uart_port* port, struct pci_dev* dev)
 {
 	// unsigned long base, len;
 	int index, ret = -ENOSPC;
@@ -2305,7 +2088,7 @@ int serial9865_register_port(struct uart_port *port, struct pci_dev *dev)
 		if (uart_9865_contxts[index].tx_dma_en == 1)
 		{
 			serial9865_ports[index].dma_tx = 1;
-			serial9865_ports[index].dma_tx_buf_v = (char *)pci_alloc_consistent(dev, DMA_TX_BUFFER_SZ, &serial9865_ports[index].dma_tx_buf_p);
+			serial9865_ports[index].dma_tx_buf_v = (char*)pci_alloc_consistent(dev, DMA_TX_BUFFER_SZ, &serial9865_ports[index].dma_tx_buf_p);
 			serial9865_ports[index].serialise_txdma = 0;
 			DEBUG("dma_tx_buf_v=0x%x\n dma_tx_buf_p=0x%x\n", (unsigned int)serial9865_ports[index].dma_tx_buf_v, serial9865_ports[index].dma_tx_buf_p);
 		}
@@ -2318,7 +2101,7 @@ int serial9865_register_port(struct uart_port *port, struct pci_dev *dev)
 		if (uart_9865_contxts[index].rx_dma_en == 1)
 		{
 			serial9865_ports[index].dma_rx = 1;
-			serial9865_ports[index].dma_rx_buf_v = (char *)pci_alloc_consistent(dev, DMA_RX_BUFFER_SZ, &serial9865_ports[index].dma_rx_buf_p);
+			serial9865_ports[index].dma_rx_buf_v = (char*)pci_alloc_consistent(dev, DMA_RX_BUFFER_SZ, &serial9865_ports[index].dma_rx_buf_p);
 			serial9865_ports[index].part_done_recv_cnt = 0;
 			serial9865_ports[index].rx_dma_done_cnt = 0;
 			DEBUG("dma_rx_buf_v=0x%x\n dma_rx_buf_p=0x%x\n", (unsigned int)serial9865_ports[index].dma_rx_buf_v, serial9865_ports[index].dma_rx_buf_p);
@@ -2378,22 +2161,18 @@ static struct pci_device_id serial9865_pci_tbl[] = {
 
 // port from deprecated linux/pci-dma-compat.h
 static inline void
-pci_free_consistent(struct pci_dev *hwdev, size_t size,
-					void *vaddr, dma_addr_t dma_handle)
+pci_free_consistent(struct pci_dev* hwdev, size_t size,
+	void* vaddr, dma_addr_t dma_handle)
 {
 	dma_free_coherent(&hwdev->dev, size, vaddr, dma_handle);
 }
 
 // PCI driver remove function. Rlease the resources used by the port
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
-static void serial9865_remove_one(struct pci_dev *dev)
-#else
-static void __devexit serial9865_remove_one(struct pci_dev *dev)
-#endif
+static void serial9865_remove_one(struct pci_dev* dev)
 {
 	int i;
 	unsigned long base;
-	struct uart_9865_port *uart = NULL;
+	struct uart_9865_port* uart = NULL;
 	DEBUG("In %s ---------------------------------------START\n", __FUNCTION__);
 	base = pci_resource_start(dev, FL_BASE0);
 
@@ -2427,11 +2206,7 @@ static void __devexit serial9865_remove_one(struct pci_dev *dev)
 }
 
 // PCI drivers probe function
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
-static int serial9865_probe(struct pci_dev *dev, const struct pci_device_id *ent)
-#else
-static int __devinit serial9865_probe(struct pci_dev *dev, const struct pci_device_id *ent)
-#endif
+static int serial9865_probe(struct pci_dev* dev, const struct pci_device_id* ent)
 {
 	int retval;
 	unsigned long base, len;
@@ -2447,7 +2222,7 @@ static int __devinit serial9865_probe(struct pci_dev *dev, const struct pci_devi
 
 	// To verify wether it is a serial communication hardware
 	if ((((dev->class >> 8) != PCI_CLASS_COMMUNICATION_SERIAL) &&
-		 ((dev->class >> 8) != PCI_CLASS_COMMUNICATION_MODEM)) ||
+		((dev->class >> 8) != PCI_CLASS_COMMUNICATION_MODEM)) ||
 		(dev->class & 0xff) > 6)
 	{
 		DEBUG("Not a serial communication hardware\n");
@@ -2477,7 +2252,6 @@ static int __devinit serial9865_probe(struct pci_dev *dev, const struct pci_devi
 	serial_port.membase = ioremap(base, len);
 	base = pci_resource_start(dev, FL_BASE0);
 	serial_port.iobase = base;
-	// printk("membase=0x%x\n mapbase=0x%x iobase:%x\n",(unsigned int)serial_port.membase,(unsigned int)serial_port.mapbase,(unsigned int)serial_port.iobase);
 	retval = serial9865_register_port(&serial_port, dev);
 	if (retval < 0)
 	{
@@ -2485,14 +2259,9 @@ static int __devinit serial9865_probe(struct pci_dev *dev, const struct pci_devi
 		goto disable;
 	}
 
-// Register a ISR
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 23)
-	if ((retval = request_irq(dev->irq, serial9865_interrupt, SA_SHIRQ, "mcs9865-serial", &serial9865_ports[retval])))
-		goto disable;
-#else
+	// Register a ISR
 	if ((retval = request_irq(dev->irq, serial9865_interrupt, IRQF_SHARED, "mcs9865-serial", &serial9865_ports[retval])))
 		goto disable;
-#endif
 
 	DEBUG("In %s ---------------------------------------END\n", __FUNCTION__);
 	return 0;
@@ -2506,11 +2275,7 @@ disable:
 static struct pci_driver mcs9865_pci_driver = {
 	.name = "mcs9865-serial",
 	.probe = serial9865_probe,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
 	.remove = serial9865_remove_one,
-#else
-	.remove = __devexit_p(serial9865_remove_one),
-#endif
 	.id_table = serial9865_pci_tbl,
 };
 

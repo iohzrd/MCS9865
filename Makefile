@@ -7,31 +7,7 @@ MAJORVERSION=$(shell uname -r | cut -d '.' -f 1)
 MINORVERSION=$(shell uname -r | cut -d '.' -f 2)
 SUBLEVEL=$(shell uname -r | cut -d '.' -f 3)
 
-ifeq ($(MAJORVERSION),6)
 MDIR=drivers/tty/serial
-else
-ifeq ($(MAJORVERSION),5)
-MDIR=drivers/tty/serial
-else
-ifeq ($(MAJORVERSION),4)
-MDIR=drivers/tty/serial
-else
-ifeq ($(MAJORVERSION),3)
-MDIR=drivers/tty/serial/
-else
-ifeq ($(MAJORVERSION),2)
-ifneq (,$(filter $(SUBLEVEL),38 39))
-MDIR=drivers/tty/serial/
-else
-MDIR=drivers/serial/
-endif
-else
-MDIR=drivers/serial/
-endif
-endif
-endif
-endif
-endif
 
 obj-m +=mcs9865.o
 obj-m +=mcs9865-isa.o
